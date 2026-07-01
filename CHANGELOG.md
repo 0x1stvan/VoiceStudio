@@ -6,6 +6,21 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 Versions track the desktop app (`tauri.conf.json` + `frontend/src-tauri/Cargo.toml`).
 The bundled TTS model package (`pyproject.toml`) is versioned independently.
 
+## [Unreleased]
+
+### Fixed
+- **cuDNN 8 compat libraries (and the VC++ Redistributable check) were never
+  installed for real installs — only for `bun run dev`.** Both lived solely in
+  `scripts/setup.py`, which isn't bundled into the packaged app and was never
+  invoked anywhere in the Tauri bootstrap. Every actual install with an NVIDIA
+  GPU therefore got a venv with no cuDNN 8 compat libs (CUDA transcription
+  silently broken), and Windows installs on a debloated image got no VC++
+  runtime check at all. Both are now ported into the Rust bootstrap
+  (`ensure_venv_ready`) so they run for the real app-data venv on every
+  launch, not just the dev loop. Also fixed `scripts/setup.py` itself, which
+  invoked `python -m pip install` — `uv venv` doesn't seed pip, so this always
+  failed with `No module named pip`; it now uses `uv pip install --python`.
+
 ## [0.3.8] — 2026-07-01
 
 A stability-focused release that makes first-run and Windows "just work," ships

@@ -680,6 +680,209 @@ pub fn backend_exit_indicates_broken_venv(exit_info: &str, err_tail: &str) -> bo
         || exit_info.trim_end().ends_with(": 106")
 }
 
+// ── Windows: VC++ Redistributable + Linux/Windows: cuDNN 8 compat ──────────
+//
+// Both of these used to live ONLY in scripts/setup.py, run via
+// `bun run setup:api` (dev loop only). Neither `scripts/` nor `setup.py` is
+// bundled as a Tauri resource (see tauri.conf.json's `bundle.resources`), and
+// the real packaged-install bootstrap path below never called that script —
+// so every actual installed user with an NVIDIA GPU got a venv with no cuDNN
+// 8 compat libs, and Windows users on a debloated image got no VC++ runtime
+// check either. Ported here so the real app-data venv gets both, matching
+// what backend/main.py's cuDNN preload (#255) expects to find.
+
+/// PyTorch's native DLLs (c10.dll, torch_cpu.dll, etc.) link against
+/// vcruntime140.dll / msvcp140.dll from the VC++ 2015-2022 Redistributable,
+/// which ships with Visual Studio / Build Tools but isn't part of Windows
+/// itself. A fresh or debloated Windows image crashes the first `import
+/// torch` with `OSError: [WinError 126] The specified module could not be
+/// found.` Detect and silently install it before that can happen.
+#[cfg(target_os = "windows")]
+fn vcredist_installed() -> bool {
+    use std::ffi::CString;
+    use std::os::raw::c_char;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(lp_lib_file_name: *const c_char) -> *mut std::ffi::c_void;
+        fn FreeLibrary(h_lib_module: *mut std::ffi::c_void) -> i32;
+    }
+    let Ok(name) = CString::new("vcruntime140.dll") else { return false };
+    unsafe {
+        let handle = LoadLibraryA(name.as_ptr());
+        if handle.is_null() {
+            false
+        } else {
+            FreeLibrary(handle);
+            true
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_vcredist_windows<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if vcredist_installed() {
+        return;
+    }
+    log::info!("VC++ Redistributable not found — installing (required for PyTorch)");
+    emit_log(app, "checking", "Installing Microsoft Visual C++ Redistributable (required for PyTorch)…");
+    let installer = std::env::temp_dir().join("vc_redist.x64.exe");
+    let outcome: io::Result<()> = (|| {
+        let resp = ureq::get("https://aka.ms/vs/17/release/vc_redist.x64.exe")
+            .timeout(Duration::from_secs(120))
+            .call()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("download: {}", e)))?;
+        let mut f = fs::File::create(&installer)?;
+        io::copy(&mut resp.into_reader(), &mut f)?;
+        drop(f);
+        let status = Command::new(&installer)
+            .args(["/install", "/quiet", "/norestart"])
+            .status()?;
+        // Exit code 3010 = success but a reboot is recommended.
+        if status.success() || status.code() == Some(3010) {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::Other, format!("installer exit code {:?}", status.code())))
+        }
+    })();
+    let _ = fs::remove_file(&installer);
+    match outcome {
+        Ok(()) => log::info!("VC++ Redistributable installed"),
+        Err(e) => {
+            log::warn!("VC++ Redistributable auto-install failed: {}", e);
+            emit_log(
+                app, "checking",
+                "Could not auto-install the VC++ Redistributable — if PyTorch fails to load, \
+install it manually from https://aka.ms/vs/17/release/vc_redist.x64.exe",
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_vcredist_windows<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) {}
+
+/// Cross-platform pin, matches the wheel scripts/setup.py has always used —
+/// keep both in sync if this ever needs to move.
+const CUDNN8_COMPAT_PIN: &str = "nvidia-cudnn-cu12==8.9.7.29";
+
+/// The `cudnn8_compat/` install target inside a venv's site-packages,
+/// mirroring `_find_compat_dir()` in scripts/setup.py exactly (and what
+/// backend/main.py's ctypes preload looks for). Linux's path is versioned by
+/// the venv's own Python (`lib/pythonX.Y/site-packages`), so this queries the
+/// live interpreter rather than assuming the version `uv venv` was asked for
+/// — the system-Python fallback path can hand back a different one.
+fn cudnn8_compat_dir(venv_dir: &Path, venv_py: &Path) -> Option<PathBuf> {
+    if cfg!(windows) {
+        return Some(venv_dir.join("Lib").join("site-packages").join("cudnn8_compat"));
+    }
+    let out = Command::new(venv_py)
+        .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let pyver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Some(
+        venv_dir
+            .join("lib")
+            .join(format!("python{}", pyver))
+            .join("site-packages")
+            .join("cudnn8_compat"),
+    )
+}
+
+/// The subdirectory (within `cudnn8_compat/`) actually holding the shared
+/// libraries, and the filename pattern that counts as "installed" — same
+/// glob scripts/setup.py's `_count_cudnn8_libs()` uses.
+fn cudnn8_lib_dir_and_pattern(compat_dir: &Path) -> (PathBuf, &'static str, &'static str) {
+    if cfg!(windows) {
+        (compat_dir.join("nvidia").join("cudnn").join("bin"), "cudnn", "64_8.dll")
+    } else {
+        (compat_dir.join("nvidia").join("cudnn").join("lib"), "libcudnn", ".so.8")
+    }
+}
+
+fn count_cudnn8_libs(lib_dir: &Path, prefix: &str, suffix: &str) -> usize {
+    fs::read_dir(lib_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with(prefix) && name.ends_with(suffix)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// CTranslate2 (faster-whisper / WhisperX) needs cuDNN 8, but PyTorch 2.8+
+/// pulls in cuDNN 9. Side-loads cuDNN 8 into `cudnn8_compat/` next to the
+/// venv's other packages — backend/main.py preloads it via ctypes at import
+/// time (#255). Skipped entirely on macOS (no CUDA) and on any machine
+/// without a CUDA device, so this never runs on CPU-only or Apple Silicon
+/// installs.
+fn ensure_cudnn8_compat<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    uv_path: &Path,
+    venv_py: &Path,
+    venv_dir: &Path,
+    project_dir: &Path,
+) {
+    if cfg!(target_os = "macos") {
+        return;
+    }
+    let Some(compat_dir) = cudnn8_compat_dir(venv_dir, venv_py) else {
+        log::warn!("cuDNN 8 compat: could not resolve venv site-packages layout — skipping");
+        return;
+    };
+    let (lib_dir, prefix, suffix) = cudnn8_lib_dir_and_pattern(&compat_dir);
+    if count_cudnn8_libs(&lib_dir, prefix, suffix) >= 5 {
+        return;
+    }
+
+    let mut cuda_check = Command::new(venv_py);
+    scrub_python_env(&mut cuda_check);
+    let cuda_available = cuda_check
+        .args(["-c", "import torch; print(torch.cuda.is_available())"])
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "True")
+        .unwrap_or(false);
+    if !cuda_available {
+        return;
+    }
+
+    log::info!("Installing cuDNN 8 compatibility libraries for CTranslate2 (#255)");
+    emit_log(app, "installing_deps", "Installing cuDNN 8 compatibility libraries for CUDA transcription…");
+    let mut cmd = Command::new(uv_path);
+    scrub_python_env(&mut cmd);
+    apply_uv_http_env(&mut cmd);
+    cmd.arg("pip")
+        .arg("install")
+        .arg("--no-deps")
+        .arg("--target")
+        .arg(&compat_dir)
+        .arg("--python")
+        .arg(venv_py)
+        .arg(CUDNN8_COMPAT_PIN)
+        .current_dir(project_dir);
+    match run_streaming(app, "installing_deps", &mut cmd) {
+        Ok(ref s) if s.success() => {
+            log::info!("cuDNN 8 compat installed: {} libraries", count_cudnn8_libs(&lib_dir, prefix, suffix));
+        }
+        other => {
+            log::warn!("cuDNN 8 compat install failed ({:?}) — CUDA transcription may not work", other);
+            emit_log(
+                app, "installing_deps",
+                "cuDNN 8 compat install failed — CUDA-based transcription may not work. \
+Retry from Settings, or see docs/install/troubleshooting.md.",
+            );
+        }
+    }
+}
+
 /// Prepare (and on first run, create) the Python venv that will host the
 /// backend process. Returns (venv_python, backend_source_dir).
 pub fn ensure_venv_ready<R: tauri::Runtime>(app: &tauri::AppHandle<R>, progress: Option<&Arc<Mutex<BootstrapStage>>>) -> Option<(PathBuf, PathBuf)> {
@@ -692,6 +895,11 @@ pub fn ensure_venv_ready<R: tauri::Runtime>(app: &tauri::AppHandle<R>, progress:
     if let Some(p) = progress {
         set_stage(p, BootstrapStage::Checking);
     }
+
+    // Runs unconditionally, before any venv path is chosen — an OS-level
+    // check independent of which venv (dev-reuse or app-data) ends up
+    // serving the backend, and a no-op after the first successful install.
+    ensure_vcredist_windows(app);
 
     if let Some(dev_root) = find_dev_project_root() {
         let dev_venv = dev_root.join(".venv");
@@ -870,6 +1078,10 @@ the existing venv; newly added dependencies may be missing (#307)",
                     }
                 }
             }
+            match resolve_uv(app, &app_data, None) {
+                Ok(uv_path) => ensure_cudnn8_compat(app, &uv_path, &venv_py, &venv_dir, &project_dir),
+                Err(e) => log::warn!("cuDNN 8 compat: could not resolve uv: {}", e),
+            }
             return Some((venv_py, backend_dir));
         }
         if matches!(uvicorn_check, Ok(ref s) if s.success()) {
@@ -980,6 +1192,7 @@ the existing venv; newly added dependencies may be missing (#307)",
                     return None;
                 }
             }
+            ensure_cudnn8_compat(app, &uv_path, &venv_py, &venv_dir, &project_dir);
             return Some((venv_py, backend_dir));
         }
         fail(progress, &format!("Repair uv sync failed: {:?}", repair_status));
@@ -1230,6 +1443,8 @@ mirror in Settings → region/mirrors (see docs/install/troubleshooting.md).".to
             }
         }
     }
+
+    ensure_cudnn8_compat(app, &uv_path, &venv_py, &venv_dir, &project_dir);
 
     // Opt-in AMD ROCm (#124): the default install ships the CUDA torch build,
     // so AMD-only machines fall back to CPU. If the user set
@@ -1548,5 +1763,63 @@ mod tests {
         // Verify 82.x (what was installed before #224 fix) does NOT satisfy
         let v82: (u32, u32) = (82, 0);
         assert!(!(v82.0 >= 75 && v82.0 < 80), "82.x (pre-fix version) must NOT satisfy <80");
+    }
+
+    // -- cuDNN 8 compat / VC++ redist (real prod bootstrap, not just dev) ----
+
+    #[cfg(windows)]
+    #[test]
+    fn cudnn8_compat_dir_matches_backend_main_py_layout() {
+        // backend/main.py hardcodes `.venv/Lib/site-packages/cudnn8_compat` on
+        // Windows (no pyver in the path) -- this must match exactly or the
+        // ctypes preload never finds what we just installed.
+        let venv_dir = PathBuf::from(r"C:\fake\project\.venv");
+        let venv_py = venv_python_path(&venv_dir);
+        let dir = cudnn8_compat_dir(&venv_dir, &venv_py).expect("windows path is pure, no subprocess needed");
+        assert_eq!(dir, venv_dir.join("Lib").join("site-packages").join("cudnn8_compat"));
+    }
+
+    #[test]
+    fn cudnn8_lib_dir_and_pattern_matches_platform_glob() {
+        // Mirrors scripts/setup.py's _cudnn8_lib_dir()/_count_cudnn8_libs() and
+        // backend/main.py's _cudnn8_glob exactly -- a divergence here means the
+        // Rust installer and the Python ctypes preload disagree on what counts
+        // as "installed".
+        let compat_dir = PathBuf::from("compat");
+        let (lib_dir, prefix, suffix) = cudnn8_lib_dir_and_pattern(&compat_dir);
+        if cfg!(windows) {
+            assert_eq!(lib_dir, compat_dir.join("nvidia").join("cudnn").join("bin"));
+            assert_eq!((prefix, suffix), ("cudnn", "64_8.dll"));
+            assert!("cudnn_ops64_8.dll".starts_with(prefix) && "cudnn_ops64_8.dll".ends_with(suffix));
+        } else {
+            assert_eq!(lib_dir, compat_dir.join("nvidia").join("cudnn").join("lib"));
+            assert_eq!((prefix, suffix), ("libcudnn", ".so.8"));
+            assert!("libcudnn_ops.so.8".starts_with(prefix) && "libcudnn_ops.so.8".ends_with(suffix));
+        }
+    }
+
+    #[test]
+    fn count_cudnn8_libs_counts_only_matching_files() {
+        let dir = temp_venv_dir("cudnn-count");
+        let (_, prefix, suffix) = cudnn8_lib_dir_and_pattern(Path::new(""));
+        // Two real matches...
+        fs::write(dir.join(format!("{prefix}_a{suffix}")), b"").unwrap();
+        fs::write(dir.join(format!("{prefix}_b{suffix}")), b"").unwrap();
+        // ...one file that only matches the prefix, one that only matches the
+        // suffix, and one totally unrelated file -- none of these should count.
+        fs::write(dir.join(format!("{prefix}_only_prefix.txt")), b"").unwrap();
+        fs::write(dir.join(format!("unrelated{suffix}")), b"").unwrap();
+        fs::write(dir.join("readme.md"), b"").unwrap();
+        assert_eq!(count_cudnn8_libs(&dir, prefix, suffix), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn count_cudnn8_libs_zero_when_dir_missing() {
+        // First-run case: the compat dir doesn't exist yet -- must report 0,
+        // not error, so the caller's ">= 5" threshold cleanly triggers install.
+        let missing = std::env::temp_dir().join("omnivoice-test-cudnn8-does-not-exist");
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(count_cudnn8_libs(&missing, "cudnn", "64_8.dll"), 0);
     }
 }
