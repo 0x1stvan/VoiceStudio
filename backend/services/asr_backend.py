@@ -27,6 +27,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 from abc import ABC, abstractmethod
 
 logger = logging.getLogger("omnivoice.asr")
@@ -51,8 +52,95 @@ class ASRTimeoutError(TimeoutError):
     """
 
 
+def reset_pool_after_wedge(executor, *, what: str = "ASR") -> bool:
+    """Abandon a GPU pool whose worker is wedged on a timed-out transcribe (#730).
+
+    Python can't kill the stuck thread, but dropping the poisoned pool means the
+    next submit (a retry, the next chunk, or a concurrent TTS generate) gets a
+    fresh worker instead of queueing behind the wedged one. This is the ONE
+    recovery mechanism shared by every transcribe path — the whole-file guards
+    (via :func:`run_transcribe_guarded`) and the chunked dub stream both route
+    through it, so the semantics can't drift between them again.
+
+    Best-effort: an executor without ``reset()`` (a plain ThreadPoolExecutor in
+    tests) is a no-op, and a failing reset never raises — this runs on the very
+    failure path it's trying to recover from. Returns True when a reset ran.
+    """
+    _reset = getattr(executor, "reset", None)
+    if not callable(_reset):
+        return False
+    try:
+        _reset()
+        logger.warning(
+            "%s transcribe wedged — abandoned the GPU-pool worker to restore "
+            "capacity (#730).", what,
+        )
+        return True
+    except Exception:
+        logger.exception("GPU pool reset after %s timeout failed", what)
+        return False
+
+
+# ── Consecutive-timeout streak → recommend the crash-isolated engine ────────
+# A pool reset restores *capacity*, but the wedged CTranslate2/whisperx thread
+# keeps its VRAM until the process exits. When guarded transcribes keep timing
+# out back-to-back in one session, resets clearly aren't recovering the
+# underlying hang — the durable fix is the crash-isolated sidecar engine
+# (services.subprocess_asr, #393), whose child process CAN be hard-killed to
+# reclaim the hung call and its VRAM. We only *recommend* it (log + error
+# message); we never switch engines automatically (owner rule: no silent
+# behavior divergence).
+_TIMEOUT_STREAK_FOR_ISOLATED_HINT = 2
+_timeout_streak = 0
+_timeout_streak_lock = threading.Lock()
+
+
+def _note_transcribe_timeout() -> int:
+    global _timeout_streak
+    with _timeout_streak_lock:
+        _timeout_streak += 1
+        return _timeout_streak
+
+
+def _note_transcribe_success() -> None:
+    global _timeout_streak
+    with _timeout_streak_lock:
+        _timeout_streak = 0
+
+
+def _isolated_engine_hint(streak: int) -> str:
+    """User-facing recommendation once resets stop recovering (streak ≥ 2).
+
+    Empty when the streak is below the threshold, or when the user is already
+    on the isolated engine (recommending it to itself would be noise — the
+    base message's smaller-model/CPU guidance is all that's left)."""
+    if streak < _TIMEOUT_STREAK_FOR_ISOLATED_HINT:
+        return ""
+    try:
+        if active_backend_id() == "faster-whisper-isolated":
+            return ""
+    except Exception:  # noqa: BLE001 — the hint must never break the error path
+        pass
+    logger.warning(
+        "%d consecutive ASR transcribe timeouts this session — pool resets are "
+        "not recovering the hang. Recommend switching the ASR engine to "
+        "'Faster-Whisper (crash-isolated subprocess)' [faster-whisper-isolated] "
+        "in Settings → Engines. Not switching automatically (#730).", streak,
+    )
+    return (
+        f"This is {streak} transcribe timeouts in a row this session, so pool "
+        "resets aren't recovering the underlying hang. Recommended: switch the "
+        "ASR engine to 'Faster-Whisper (crash-isolated subprocess)' "
+        "(faster-whisper-isolated) in Settings → Engines — it runs "
+        "transcription in a separate process that can be force-killed to "
+        "reclaim a hung transcribe and its VRAM. OmniVoice never switches "
+        "engines automatically."
+    )
+
+
 async def run_transcribe_guarded(executor, fn, *, what: str = "ASR",
-                                 timeout: float = ASR_TRANSCRIBE_TIMEOUT_S):
+                                 timeout: float = ASR_TRANSCRIBE_TIMEOUT_S,
+                                 timeout_env: str = "OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S"):
     """Run a blocking transcribe ``fn`` in ``executor`` with a hard wall-clock
     bound. On timeout, raise :class:`ASRTimeoutError` with guidance instead of
     letting the request hang forever.
@@ -73,30 +161,30 @@ async def run_transcribe_guarded(executor, fn, *, what: str = "ASR",
     loop = asyncio.get_running_loop()
     fut = loop.run_in_executor(executor, fn)
     try:
-        return await asyncio.wait_for(fut, timeout=timeout)
+        result = await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
         # Free the poisoned pool so a hung transcribe can't keep starving TTS /
         # other ASR work (the "can't reach backend" symptom, #730).
-        _reset = getattr(executor, "reset", None)
-        if callable(_reset):
-            try:
-                _reset()
-                logger.warning(
-                    "%s transcription exceeded %.0fs — abandoned the GPU-pool "
-                    "worker to restore capacity (#730).", what, timeout,
-                )
-            except Exception:
-                logger.exception("GPU pool reset after ASR timeout failed")
-        raise ASRTimeoutError(
+        reset_pool_after_wedge(executor, what=what)
+        streak = _note_transcribe_timeout()
+        msg = (
             f"{what} transcription exceeded {timeout:.0f}s and was abandoned — "
             "the backend is running, but the ASR model is too heavy for the "
             "available compute. Most often the GPU is VRAM-starved: the resident "
             "TTS model and a large ASR model (large-v3) contend for memory. "
             "Capacity was restored automatically, but for a durable fix Flush the "
             "TTS model to free VRAM, pick a smaller ASR model in Settings → "
-            "Models, or set ASR to CPU. (Raise OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S "
-            "for very long single files.)"
+            f"Models, or set ASR to CPU. (Raise {timeout_env} "
+            "for very long transcribes.)"
         )
+        hint = _isolated_engine_hint(streak)
+        if hint:
+            msg += " " + hint
+        raise ASRTimeoutError(msg)
+    # A completed transcribe (even a failed-but-returned one) proves the pool
+    # isn't hung — only genuine timeouts count toward the consecutive streak.
+    _note_transcribe_success()
+    return result
 
 
 def _compute_type_candidates(device: str) -> list[str]:
@@ -316,6 +404,74 @@ class WhisperXBackend(ASRBackend):
             pass
         return "cpu", "int8"
 
+    # Peak VRAM (GB) to load *and transcribe* whisper large-v3 per CTranslate2
+    # compute type (weights + encoder/decoder workspace, with headroom). #723:
+    # on an 8 GB card with the TTS model resident, loading fp16 large-v3 dies
+    # as a *native* CUDA OOM abort — the process is killed, no Python
+    # exception ever fires, and the UI reports "Can't reach the local
+    # backend". The only defense is to never start that load, so the device
+    # pick is re-checked against actually-free VRAM right before loading.
+    _CUDA_VRAM_BUDGET_GB = {"float16": 5.0, "int8_float16": 3.5, "int8": 3.0}
+
+    #: Budget multiplier by model size (budgets above are for large-v3).
+    _MODEL_VRAM_SCALE = (
+        ("large", 1.0), ("turbo", 0.55), ("medium", 0.5),
+        ("small", 0.25), ("base", 0.15), ("tiny", 0.1),
+    )
+
+    @staticmethod
+    def _free_vram_gb():
+        """Device-wide free VRAM in GB (counts other processes), or None."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free, _total = torch.cuda.mem_get_info()
+                return free / 1024**3
+        except Exception:  # noqa: BLE001 — preflight must never block ASR
+            pass
+        return None
+
+    @classmethod
+    def _model_scale(cls, model_name: str) -> float:
+        name = (model_name or "").lower()
+        for key, scale in cls._MODEL_VRAM_SCALE:
+            if key in name:
+                return scale
+        return 1.0  # unknown → assume large
+
+    def _degrade_for_vram(self, device: str, compute_type: str) -> tuple[str, str]:
+        """Downgrade the CUDA compute type (or fall to CPU) if free VRAM can't
+        hold the model — preventing the un-catchable native OOM abort (#723).
+        Opt-out: OMNIVOICE_ASR_VRAM_PREFLIGHT=0."""
+        if device != "cuda" or os.environ.get(
+            "OMNIVOICE_ASR_VRAM_PREFLIGHT", "1"
+        ).strip().lower() in ("0", "false", "no"):
+            return device, compute_type
+        free = self._free_vram_gb()
+        if free is None:
+            return device, compute_type
+        scale = self._model_scale(self._model_name)
+        candidates = list(self._CUDA_VRAM_BUDGET_GB)
+        start = candidates.index(compute_type) if compute_type in candidates else 0
+        for ct in candidates[start:]:
+            if free >= self._CUDA_VRAM_BUDGET_GB[ct] * scale:
+                if ct != compute_type:
+                    logger.warning(
+                        "whisperx VRAM preflight: %.1f GB free < %.1f GB needed "
+                        "for %s %s — degrading to %s (#723)",
+                        free, self._CUDA_VRAM_BUDGET_GB[compute_type] * scale,
+                        self._model_name, compute_type, ct,
+                    )
+                return device, ct
+        logger.warning(
+            "whisperx VRAM preflight: %.1f GB free is too little for %s on CUDA "
+            "(needs ≥%.1f GB even at int8) — using CPU int8 instead. Free VRAM "
+            "(flush the TTS model, or close other GPU apps) for GPU-speed ASR. (#723)",
+            free, self._model_name,
+            self._CUDA_VRAM_BUDGET_GB["int8"] * scale,
+        )
+        return "cpu", "int8"
+
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
         try:
@@ -346,6 +502,13 @@ class WhisperXBackend(ASRBackend):
         # (#630/#611/#647). No-op on macOS/Linux and when speechbrain is absent.
         _harden_speechbrain_lazy_imports()
         import whisperx
+        # #723: re-check the CUDA pick against *currently free* VRAM — the TTS
+        # model may have claimed the card since __init__. A too-big load dies
+        # as a native abort (whole process, no exception), so it must be
+        # avoided up front rather than caught below.
+        self._device, self._compute_type = self._degrade_for_vram(
+            self._device, self._compute_type
+        )
         logger.info(
             "whisperx loading ASR %s on %s (%s)",
             self._model_name, self._device, self._compute_type,
@@ -997,7 +1160,7 @@ class PyTorchWhisperBackend(ASRBackend):
         return result if isinstance(result, dict) else {"chunks": [], "raw": result}
 
 
-# ── NeMo Parakeet TDT (NVIDIA — English SOTA from ASR Leaderboard) ─────────
+# ── NeMo Parakeet TDT (NVIDIA — Open ASR Leaderboard SOTA, 25 langs) ────────
 
 
 class NeMoASRBackend(ASRBackend):
@@ -1005,16 +1168,14 @@ class NeMoASRBackend(ASRBackend):
 
     FastConformer encoder + Token-and-Duration Transducer decoder.
     Beats Whisper large-v3 on English benchmarks (~6% WER).
-    Supports 25+ European languages with auto language detection.
-    Requires NVIDIA GPU.
+    Supports 25 (mostly European) languages with auto language detection.
+    CUDA or CPU — parakeet-tdt-0.6b-v3 measured RTF 0.08–0.23 on an Apple
+    Silicon M2 *CPU* (2026-07-02), ~20× faster than faster-whisper large-v3
+    int8 on the same host, so the old hard CUDA gate was a false claim.
     """
     id = "nemo-parakeet"
-    # CUDA-only: is_available() hard-fails without a GPU ("Parakeet TDT requires
-    # NVIDIA GPU (CUDA)"), so declaring a CPU path would be a false claim. On a
-    # CPU host this correctly resolves to routing_status="unavailable", matching
-    # is_available()=False (the matrix suppresses the routing badge there).
-    gpu_compat = ("cuda",)
-    display_name = "Parakeet TDT (NVIDIA NeMo — English SOTA)"
+    gpu_compat = ("cuda", "cpu")
+    display_name = "Parakeet TDT (NVIDIA NeMo — 25 langs, CUDA/CPU)"
 
     def __init__(self):
         self._model_name = os.environ.get(
@@ -1024,10 +1185,11 @@ class NeMoASRBackend(ASRBackend):
 
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
+        # No CUDA gate: the 0.6B TDT model is comfortably faster than realtime
+        # on CPU (see class docstring), so availability is a pure dependency
+        # check and engine_routing picks the effective device from gpu_compat.
         try:
-            import torch
-            if not torch.cuda.is_available():
-                return False, "Parakeet TDT requires NVIDIA GPU (CUDA)"
+            import torch  # noqa: F401
         except ImportError:
             return False, "PyTorch not installed"
         try:
@@ -1520,6 +1682,12 @@ _INSTALL_HINTS: dict[str, str] = {
     "moonshine":       "pip install useful-moonshine  (edge/CPU-optimized ASR)",
     "funasr":          "pip install funasr  (SenseVoiceSmall + FSMN-VAD; CUDA or CPU)",
     "sherpa-onnx-asr": "uv add sherpa-onnx  (ONNX live dictation; CPU, cross-platform)",
+    "faster-whisper-isolated": (
+        "No extra install (reuses faster-whisper). Escape hatch for hanging "
+        "transcribes: runs ASR in a separate process that can be force-killed "
+        "to reclaim a hung transcribe and its VRAM (#730). Slightly slower per "
+        "call than in-process faster-whisper."
+    ),
 }
 
 # Most-recent failure per backend, so a transient probe error survives between
@@ -1633,6 +1801,14 @@ def active_backend_id() -> str:
     return _auto_detect()
 
 
+# Subprocess-isolated backends must be process-wide singletons: their
+# ``__init__`` registers an atexit shutdown hook and the instance owns the
+# sidecar child process, so a fresh instance per request would leak handler
+# entries and respawn the sidecar (reloading its model) on every transcribe.
+# Same rationale as api.routers.engines._ENGINE_INSTANCES.
+_ISOLATED_INSTANCES: dict[str, "ASRBackend"] = {}
+
+
 def get_active_asr_backend(*, asr_pipe=None) -> ASRBackend:
     bid = active_backend_id()
     if bid == "pytorch-whisper":
@@ -1645,7 +1821,14 @@ def get_active_asr_backend(*, asr_pipe=None) -> ASRBackend:
         return WhisperXBackend()
     if bid not in _REGISTRY:
         raise ValueError(f"Unknown ASR backend: {bid!r}. Known: {list(_REGISTRY)}")
-    return _REGISTRY[bid]()
+    cls = _REGISTRY[bid]
+    if getattr(cls, "_is_subprocess_isolated", False):
+        inst = _ISOLATED_INSTANCES.get(bid)
+        if inst is None:
+            inst = cls()
+            _ISOLATED_INSTANCES[bid] = inst
+        return inst
+    return cls()
 
 
 def transcribe_reference(audio_path: str) -> str | None:

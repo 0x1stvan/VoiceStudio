@@ -113,10 +113,11 @@ def test_llm_off_chat_raises_actionable(monkeypatch):
     assert "TRANSLATE_BASE_URL" in str(ei.value)
 
 
-def test_llm_auto_selects_off_when_nothing_configured(monkeypatch):
-    for var in ("OMNIVOICE_LLM_BACKEND", "TRANSLATE_BASE_URL",
-                "TRANSLATE_API_KEY", "OPENAI_API_KEY"):
-        monkeypatch.delenv(var, raising=False)
+def test_llm_auto_selects_off_when_nothing_configured(clean_llm_env):
+    # clean_llm_env (conftest) clears the FULL provider env surface — a
+    # hand-picked 4-var list left e.g. LLM_DEFAULT_PROVIDER / GROQ_API_KEY
+    # standing when an earlier test imported `main` (which dotenv-loads the
+    # developer's .env into os.environ), reading as 'configured' (#878).
     assert llm_backend.active_backend_id() == "off"
 
 
@@ -131,3 +132,68 @@ def test_llm_auto_selects_openai_compat_when_configured(monkeypatch):
     except ImportError:
         pytest.skip("openai package not available in this environment")
     assert llm_backend.active_backend_id() == "openai-compat"
+
+
+# ── HF Hub closed-client recovery (#880) ────────────────────────────────────
+#
+# huggingface_hub ≥1.x shares one global httpx client; if it gets closed
+# mid-lifecycle, an engine's first-use model download inside the generate
+# path dies with "Cannot send a request, as the client has been closed".
+# The load must retry exactly once with a fresh client — and must NOT retry
+# unrelated failures.
+
+
+def test_hf_retry_recovers_from_closed_client_once():
+    calls = []
+
+    def loader():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+        return "model"
+
+    assert tts_backend._retry_once_with_fresh_hf_client(loader, what="test") == "model"
+    assert len(calls) == 2
+
+
+def test_hf_retry_matches_wrapped_closed_client_error():
+    # An engine can wrap the httpx error — detection walks the chain.
+    calls = []
+
+    def loader():
+        calls.append(1)
+        if len(calls) == 1:
+            try:
+                raise RuntimeError("Cannot send a request, as the client has been closed.")
+            except RuntimeError as inner:
+                raise RuntimeError("KittenTTS init failed") from inner
+        return "model"
+
+    assert tts_backend._retry_once_with_fresh_hf_client(loader, what="test") == "model"
+    assert len(calls) == 2
+
+
+def test_hf_retry_does_not_retry_unrelated_errors():
+    calls = []
+
+    def loader():
+        calls.append(1)
+        raise ValueError("bad checkpoint id")
+
+    with pytest.raises(ValueError):
+        tts_backend._retry_once_with_fresh_hf_client(loader, what="test")
+    assert len(calls) == 1
+
+
+def test_hf_retry_is_single_shot():
+    # A second closed-client failure propagates (the generation classifier
+    # then labels it a network problem) — no infinite retry loop.
+    calls = []
+
+    def loader():
+        calls.append(1)
+        raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+    with pytest.raises(RuntimeError):
+        tts_backend._retry_once_with_fresh_hf_client(loader, what="test")
+    assert len(calls) == 2

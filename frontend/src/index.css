@@ -694,16 +694,16 @@ samp,
   display: grid;
   /* [rail 48px] [sidebar 180–220] [main 1fr] */
   grid-template-columns: 48px minmax(180px, 220px) minmax(0, 4fr);
-  grid-template-rows: auto 1fr;
+  /* Rows: [header] [content 1fr] [LogsFooter]. The footer is a REAL grid row
+     (not a fixed overlay): content in row 2 physically ends at the footer's
+     top edge, so bottom buttons can never render underneath it — at any
+     window height, collapsed or expanded. This retires the whole
+     padding-bottom/--logs-footer-height reservation class of clipping bugs
+     (#476, #504, and the small-window "buttons hidden under footer" report).
+     The nav rail spans rows 2/-1 so it still runs top-to-bottom beside the
+     footer, exactly like the old fixed-inset look. */
+  grid-template-rows: auto 1fr auto;
   gap: 0px;
-  /* Shrink the studio grid by the LogsFooter's current height so its
-     sidebar + main column always stop exactly at the footer's top edge.
-     The footer itself (position:fixed) writes `--logs-footer-height` on
-     :root whenever it toggles collapsed/expanded or the user resizes. */
-  /* Full window height: the nav rail must run top-to-bottom regardless of the
-     footer's state. Content columns (not the grid) yield to the fixed footer
-     via padding-bottom below, so expanding the logs panel never compresses
-     the side menubar. */
   overflow: hidden;
   transition: grid-template-columns var(--transition-smooth);
 }
@@ -717,14 +717,11 @@ html[data-zoom-layout='off'] .app-container {
   height: 100vh;
   zoom: 1;
 }
-/* Keep scrollable content clear of the fixed footer. The footer writes its
-   current height (pre-zoom px — same coordinate space as these children) to
-   --logs-footer-height whenever it collapses/expands/resizes. */
-.app-container > .main-content,
-.app-container > .history-panel {
-  padding-bottom: var(--logs-footer-height, 28px);
-  box-sizing: border-box;
-}
+/* No padding-bottom footer reservation here anymore: the LogsFooter occupies
+   grid row 3 (see grid-template-rows above), so row-2 content stops at its
+   top edge by construction. The footer still writes --logs-footer-height for
+   the fixed toasts/previews that anchor above it (VoicePreview, ExportModal,
+   etc.). */
 .app-container.sidebar-collapsed {
   grid-template-columns: 48px 46px minmax(0, 4fr);
 }
@@ -759,7 +756,9 @@ html[data-zoom-layout='off'] .app-container {
 .app-container.rail-right.sidebar-collapsed > .history-panel { grid-column: 1; }
 .app-container > .nav-rail {
   grid-column: 1;
-  grid-row: 2;
+  /* Span the footer row too: the rail runs top-to-bottom beside the footer
+     (same look as the old fixed-footer 48px inset). */
+  grid-row: 2 / -1;
 }
 .app-container > .history-panel {
   grid-column: 2;
@@ -2749,24 +2748,26 @@ input[type="file"]::file-selector-button:hover {
   user-select: none;
 }
 
-/* The footer sits *beside* the nav rail (a 48px grid column of .app-container),
-   never under or over it. Splash/wizard footers render outside .app-container
-   and stay full-width. */
+/* Inside the shell the footer is a GRID ITEM (row 3), not a fixed overlay —
+   content in row 2 physically cannot render underneath it (the fix for
+   "buttons hidden under the footer on small windows"; class previously
+   band-aided per-page in #476/#504). The base `position: fixed` above still
+   applies to the splash/wizard footers, which render outside .app-container
+   and stay full-width. It sits *beside* the nav rail (rail spans rows 2/-1). */
 .app-container .logs-footer {
-  left: 48px;
-  right: 0;
+  position: static;
+  grid-row: 3;
+  grid-column: 2 / -1;
 }
 .app-container.rail-right .logs-footer {
-  left: 0;
-  right: 48px;
+  grid-column: 1 / -2;
 }
-/* ≤600px the nav rail is hidden — footer reclaims the full width. */
-@media (max-width: 600px) {
-  .app-container .logs-footer,
-  .app-container.rail-right .logs-footer {
-    left: 0;
-    right: 0;
-  }
+/* shell-mini: the nav rail is hidden — footer reclaims the full width.
+   (Class-driven like the other shell-* rules, so it tracks the EFFECTIVE
+   scaled width rather than a raw @media viewport width.) */
+.app-container.shell-mini .logs-footer,
+.app-container.shell-mini.rail-right .logs-footer {
+  grid-column: 1 / -1;
 }
 
 /* (b) Collapsed/open height ----------------------------------------------- */
@@ -2794,6 +2795,23 @@ input[type="file"]::file-selector-button:hover {
   0%, 100% { opacity: 0.7; transform: scale(1); }
   50%      { opacity: 1;   transform: scale(1.08); }
 }
+/* Donation-moment popover (DonateMomentPopover.jsx): Clippy-esque bounce-in,
+   collapsing to a plain fade under prefers-reduced-motion (the JSX swaps the
+   animation via motion-reduce:). donate-heart-pulse is the gentle attention
+   pulse the heart runs only while the popover is open. */
+@keyframes donate-pop-in {
+  0%   { opacity: 0; transform: translateY(10px) scale(0.9); }
+  60%  { opacity: 1; transform: translateY(-3px) scale(1.03); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes donate-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes donate-heart-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 1; transform: scale(1.22); }
+}
 
 /* ═══ from src/components/CaptureWidget.css ═══ */
 /* ── Capture Pill ────────────────────────────────────────────────────────
@@ -2807,7 +2825,9 @@ input[type="file"]::file-selector-button:hover {
   gap: 10px;
   padding: 10px 16px;
   min-width: 180px;
-  max-width: 280px;
+  /* Wide enough for the waveform + status labels ("Downloading voice
+     model… 42%") and the Accessibility action button. */
+  max-width: 340px;
   height: 48px;
   background: rgba(18, 18, 22, 0.88);
   backdrop-filter: blur(24px) saturate(180%);
@@ -2852,6 +2872,10 @@ input[type="file"]::file-selector-button:hover {
 
 .capture-pill--error {
   border-color: rgba(239, 68, 68, 0.3);
+}
+
+.capture-pill--setup {
+  border-color: rgba(245, 158, 11, 0.35);
 }
 
 /* ── Animations ─────────────────────────────────────────────────────── */
@@ -2900,9 +2924,36 @@ input[type="file"]::file-selector-button:hover {
   animation: none;
 }
 
+.capture-pill--setup .capture-pill__dot {
+  background: #f59e0b;
+  animation: none;
+}
+
 @keyframes dot-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50%      { opacity: 0.4; transform: scale(0.6); }
+}
+
+/* ── Live waveform (recording) ──────────────────────────────────────────
+   Data-driven bars — heights come from the captureWaveform ring buffer
+   (client-side RMS of the mic worklet frames), not a CSS animation, so the
+   movement is the actual signal. */
+
+.capture-pill__wave {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  width: 44px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.capture-pill__wave-bar {
+  flex: 1 1 0;
+  min-height: 2px;
+  border-radius: 1px;
+  background: #ef4444;
+  transition: height 60ms linear;
 }
 
 /* ── Content / timer / dismiss ──────────────────────────────────────────
@@ -2917,6 +2968,7 @@ input[type="file"]::file-selector-button:hover {
 @media (prefers-reduced-motion: reduce) {
   .capture-pill { animation: none; opacity: 1; }
   .capture-pill__dot { animation: none !important; }
+  .capture-pill__wave-bar { transition: none; }
 }
 
 /* ── Widget-mode body (standalone Tauri window) ─────────────────────── */

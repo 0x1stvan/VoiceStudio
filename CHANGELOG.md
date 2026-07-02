@@ -8,7 +8,38 @@ The bundled TTS model package (`pyproject.toml`) is versioned independently.
 
 ## [Unreleased]
 
+### Added
+
+- **Dictation, rebuilt.** The dictation pill now shows a live waveform the
+  moment the mic opens, streams words as you speak with real download/loading
+  progress on first use, and finishes what you say in about half a second of
+  silence instead of two-and-a-half. Transcripts come out properly
+  capitalized and punctuated. Text insertion is now honest and safe: your
+  clipboard is preserved and restored, failures show what to do (including a
+  one-click jump to macOS Accessibility settings when permission is missing)
+  instead of a false "Pasted", and Esc cancels cleanly at any point. The
+  dictation model also pre-warms in the background after launch, so the first
+  press of the hotkey no longer sits on a cold model load.
+
+- **LLM Providers: one-click connection testing with real diagnostics.** The
+  Test button in Settings → LLM Providers now measures round-trip latency and
+  turns failures into plain-language guidance — bad key (401/403), wrong
+  model or URL (404), rate-limited (429), or unreachable server — instead of
+  a raw exception dump. A new "Fetch models" button lists every model your
+  key can access so you pick from real names instead of guessing. The whole
+  panel is now translated into all 21 languages, provider error messages
+  never echo your API key, and the settings API gained full test coverage.
+
+### Changed
+
+- **The app now always opens maximized (not fullscreen).** Window size and
+  position are no longer carried over from the previous session — one manual
+  resize used to make every later launch reopen at that smaller size,
+  overriding the intended maximized default. Same behavior on macOS
+  (zoomed window, not a fullscreen Space), Windows, and Linux.
+
 ### Fixed
+
 - **CUDA transcription now works on packaged NVIDIA installs — the cuDNN 8
   compat libraries install automatically at launch.** The install step only
   existed in the dev-loop `scripts/setup.py`, which isn't bundled into the
@@ -20,6 +51,44 @@ The bundled TTS model package (`pyproject.toml`) is versioned independently.
   installing the cuDNN 8 libs in the dev loop.** `uv venv` doesn't seed pip
   into the venv, so `python -m pip install` always broke; the script now uses
   `uv pip install --python` instead. (#869)
+
+- **Buttons can no longer hide under the logs footer on small windows.** The
+  bottom status/logs bar was a fixed overlay that pages had to compensate for
+  with padding — any view that missed it (voice-card grids in Gallery and
+  Community, bottom action rows) clipped under the bar at small window sizes,
+  a class previously patched one page at a time (#476, #504). The footer is
+  now a real row of the app shell, so content physically ends at its top edge
+  at every window size, collapsed or expanded — guarded by a new layout test
+  plus a 900×600 Playwright check at the app's minimum window size.
+
+- **Confucius4-TTS is now validated end-to-end — and actually loads.** The
+  opt-in engine's first live run (Apple Silicon, CPU) caught three
+  scaffold-era faults: the sidecar could never import `confuciustts` (upstream
+  ships no packaging, so the documented `pip install -e` fails — the sidecar
+  and bootstrap probe now put the clone on `sys.path`, like upstream's own
+  example), the assumed 24 kHz sample rate was wrong (confirmed **22 050 Hz**,
+  now regression-tested), and the docs demanded an Amphion/MaskGCT install
+  that doesn't exist (all weights auto-download from HuggingFace). CPU is
+  ~17× realtime, so CUDA stays the recommended path; `gpu_compat` now
+  advertises `("cuda", "cpu")`. (#590)
+
+- **Parakeet TDT transcription now works without an NVIDIA GPU.** The
+  `nemo-parakeet` ASR engine (parakeet-tdt-0.6b-v3, 25 languages, word
+  timestamps) was hard-gated behind CUDA — but a live measurement on an Apple
+  Silicon M2 shows it transcribing at ~10× realtime *on CPU*, roughly 20×
+  faster than the default whisper-large-v3 on the same machine at equal
+  accuracy. The false GPU gate is removed, so Mac and CPU-only users can now
+  pick the dramatically faster engine in Settings → Engines.
+
+- **8 GB GPUs: voice-clone/dub transcription no longer kills the backend.**
+  On cards where the TTS model already held most of the VRAM (e.g. RTX
+  4060 Ti 8 GB), loading whisper `large-v3` in float16 for a reference-clip
+  or dub transcription died as a *native* CUDA out-of-memory abort — the
+  whole backend process vanished with no error logged, and the app showed
+  "Can't reach the local OmniVoice backend." A new VRAM preflight re-checks
+  free GPU memory right before the ASR load and steps down float16 →
+  int8 → CPU instead of attempting a load that can't fit (opt-out:
+  `OMNIVOICE_ASR_VRAM_PREFLIGHT=0`). (#723)
 
 ## [0.3.8] — 2026-07-01
 

@@ -55,6 +55,59 @@ def _mask_hf_tokens(value):
     return _HF_TOKEN_MASK_RE.sub(_HF_TOKEN_MASK, value)
 
 
+# ── HF Hub closed-client recovery (#880) ────────────────────────────────────
+#
+# huggingface_hub ≥1.x shares ONE global httpx client across every download.
+# If anything closes it mid-lifecycle, every later hub call — e.g. an engine's
+# first-use model download inside the generate path — dies with httpx's
+# "Cannot send a request, as the client has been closed". The client is
+# recoverable: ``close_session()`` drops it and the next hub call builds a
+# fresh one, so the correct handling is a single targeted retry, not a
+# user-facing failure.
+
+
+def _is_closed_client_error(e) -> bool:
+    """True iff ``e`` (or anything in its __cause__/__context__ chain) is
+    httpx's closed-client lifecycle error. Cycle-safe."""
+    seen, stack = set(), [e]
+    while stack:
+        exc = stack.pop()
+        if exc is None or id(exc) in seen:
+            continue
+        seen.add(id(exc))
+        low = str(exc).lower()
+        if "client has been closed" in low or "cannot send a request" in low:
+            return True
+        stack.append(exc.__cause__)
+        stack.append(exc.__context__)
+    return False
+
+
+def _retry_once_with_fresh_hf_client(loader, what: str):
+    """Run ``loader()`` — a model constructor that may download from the HF
+    Hub on first use. On the specific closed-client failure above, reset the
+    hub's shared client and retry exactly ONCE. Any other failure (and a
+    repeat closed-client failure) propagates untouched, where the generation
+    error classifier labels it as a network problem (#880)."""
+    try:
+        return loader()
+    except Exception as e:
+        if not _is_closed_client_error(e):
+            raise
+        logger.warning(
+            "%s: HF Hub httpx client was closed mid-download (%s); "
+            "retrying once with a fresh client.", what, e,
+        )
+        try:
+            from huggingface_hub.utils import close_session
+            close_session()
+        except Exception:  # pragma: no cover — hub too old / API renamed
+            logger.warning(
+                "%s: couldn't reset the HF Hub client; retrying anyway.", what,
+            )
+        return loader()
+
+
 # ── Protocol ────────────────────────────────────────────────────────────────
 
 
@@ -587,7 +640,13 @@ class KittenTTSBackend(TTSBackend):
             "OMNIVOICE_KITTENTTS_MODEL", "KittenML/kitten-tts-mini-0.8"
         )
         logger.info("Loading KittenTTS from %s", checkpoint)
-        self._model = KittenTTS(checkpoint)
+        # #880: the first-use load downloads ~80 MB from the HF Hub inside the
+        # generate path; if the hub's shared httpx client was closed
+        # mid-lifecycle, retry once with a fresh client instead of failing
+        # the whole generation.
+        self._model = _retry_once_with_fresh_hf_client(
+            lambda: KittenTTS(checkpoint), what="KittenTTS"
+        )
 
     def generate(self, text: str, **kw) -> torch.Tensor:
         import numpy as np
@@ -1160,9 +1219,9 @@ _LAZY_REGISTRY: dict[str, tuple[str, str]] = {
     "dots-tts": ("engines.dots_tts", "DotsTTSBackend"),
     # Issue #590: Confucius4-TTS (netease-youdao) — LLM-based, 14-language
     # cross-lingual zero-shot cloning, Apache-2.0. Opt-in + subprocess-isolated
-    # (own Python 3.10 + CUDA venv) like the entries above. ⚠️ scaffold: the
-    # sidecar's synthesis API is README-derived and needs hardware validation;
-    # it's gated behind OMNIVOICE_CONFUCIUS4_TTS_DIR so it's inert until enabled.
+    # (own Python 3.10 venv) like the entries above. Validated end-to-end
+    # 2026-07-02 (CPU, Apple Silicon; 22.05 kHz output). Gated behind
+    # OMNIVOICE_CONFUCIUS4_TTS_DIR so it's inert until enabled.
     "confucius4-tts": ("engines.confucius4", "Confucius4Backend"),
 }
 
@@ -1259,7 +1318,7 @@ _INSTALL_HINTS: dict[str, str] = {
     "supertonic3":   "uv sync --extra supertonic  (CPU-only ONNX, 31 langs, ~400 MB model on first use; OpenRAIL-M model license)",
     "moss-tts-v15":  "git clone OpenMOSS/MOSS-TTS + set OMNIVOICE_MOSS_TTS_V15_DIR  (own venv, transformers==5.0; 8B, ~16 GB weights; CUDA/CPU, no MPS; Apache-2.0)",
     "dots-tts":      "git clone rednote-hilab/dots.tts + set OMNIVOICE_DOTS_TTS_DIR  (own venv, transformers==4.57; 2B, ~9 GB weights; CUDA/CPU, Linux/macOS only — no Windows; Apache-2.0)",
-    "confucius4-tts":"git clone netease-youdao/Confucius4-TTS + set OMNIVOICE_CONFUCIUS4_TTS_DIR  (own Python 3.10/CUDA venv; 14-lang cross-lingual zero-shot clone; NVIDIA GPU required; Apache-2.0)",
+    "confucius4-tts":"git clone netease-youdao/Confucius4-TTS + set OMNIVOICE_CONFUCIUS4_TTS_DIR  (own Python 3.10 venv; 14-lang cross-lingual zero-shot clone; ~5 GB weights auto-download; CUDA/CPU, no MPS; Apache-2.0)",
 }
 
 

@@ -205,6 +205,11 @@ mod media_permission_tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // #879: if the previous run requested a WebView cache repair (splash
+    // recovery panel → clear_webview_cache_and_relaunch), perform it now —
+    // before any webview exists, so WebView2 holds no locks on the profile.
+    commands::clear_webview_cache_if_marked();
+
     // ── Detect pill mode from CLI args OR persisted config ────────────────
     // CLI flag takes precedence. If not passed, fall back to the
     // `launch_as_widget` config field (set via tray "Switch to Pill Mode" or
@@ -256,6 +261,8 @@ pub fn run() {
             commands::hf_cache_scan,
             commands::simulate_paste,
             commands::simulate_type,
+            commands::check_accessibility,
+            commands::open_accessibility_settings,
             commands::set_tray_recording,
             commands::quit_app,
             commands::save_text_file,
@@ -263,6 +270,7 @@ pub fn run() {
             commands::set_dictation_shortcut,
             commands::get_launch_as_widget,
             commands::set_launch_as_widget,
+            commands::clear_webview_cache_and_relaunch,
         ])
         .setup(move |app| {
             app.handle().plugin(tauri_plugin_dialog::init())?;
@@ -274,10 +282,14 @@ pub fn run() {
             // launch if the user happened to be dictating when they quit,
             // overriding the WebviewWindowBuilder `.visible(false)` below.
             // Symptom: pill appears on app load with no shortcut press.
-            // The main window is fine to persist (size/position are useful).
+            // "main" is denylisted too (owner decision, 2026-07-02): the app
+            // must ALWAYS open maximized — not fullscreen — per
+            // tauri.conf.json (`maximized: true`, `fullscreen: false`).
+            // Persisting geometry meant one manual resize made every later
+            // launch reopen at that smaller size, overriding the config.
             app.handle().plugin(
                 tauri_plugin_window_state::Builder::default()
-                    .with_denylist(&["widget"])
+                    .with_denylist(&["widget", "main"])
                     .build(),
             )?;
             app.handle().plugin(
@@ -591,6 +603,17 @@ pub fn run() {
                 // or stale state would otherwise show it on startup.
                 if let Some(win) = app.get_webview_window("widget") {
                     let _ = win.hide();
+                }
+                // Enforce the always-open-maximized contract (#881) at
+                // runtime: macOS can ignore `maximized: true` from
+                // tauri.conf.json at window creation when combined with the
+                // Overlay title-bar style, so the config flag alone isn't
+                // reliable. maximize() zooms the window — it never enters a
+                // fullscreen Space. Guarded by tests/test_window_launch_state.py.
+                if let Some(main_win) = app.get_webview_window("main") {
+                    if !main_win.is_maximized().unwrap_or(false) {
+                        let _ = main_win.maximize();
+                    }
                 }
             }
 
