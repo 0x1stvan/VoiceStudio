@@ -680,86 +680,21 @@ pub fn backend_exit_indicates_broken_venv(exit_info: &str, err_tail: &str) -> bo
         || exit_info.trim_end().ends_with(": 106")
 }
 
-// ── Windows: VC++ Redistributable + Linux/Windows: cuDNN 8 compat ──────────
+// ── Linux/Windows: cuDNN 8 compat side-load ────────────────────────────────
 //
-// Both of these used to live ONLY in scripts/setup.py, run via
-// `bun run setup:api` (dev loop only). Neither `scripts/` nor `setup.py` is
-// bundled as a Tauri resource (see tauri.conf.json's `bundle.resources`), and
-// the real packaged-install bootstrap path below never called that script —
-// so every actual installed user with an NVIDIA GPU got a venv with no cuDNN
-// 8 compat libs, and Windows users on a debloated image got no VC++ runtime
-// check either. Ported here so the real app-data venv gets both, matching
-// what backend/main.py's cuDNN preload (#255) expects to find.
-
-/// PyTorch's native DLLs (c10.dll, torch_cpu.dll, etc.) link against
-/// vcruntime140.dll / msvcp140.dll from the VC++ 2015-2022 Redistributable,
-/// which ships with Visual Studio / Build Tools but isn't part of Windows
-/// itself. A fresh or debloated Windows image crashes the first `import
-/// torch` with `OSError: [WinError 126] The specified module could not be
-/// found.` Detect and silently install it before that can happen.
-#[cfg(target_os = "windows")]
-fn vcredist_installed() -> bool {
-    use std::ffi::CString;
-    use std::os::raw::c_char;
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn LoadLibraryA(lp_lib_file_name: *const c_char) -> *mut std::ffi::c_void;
-        fn FreeLibrary(h_lib_module: *mut std::ffi::c_void) -> i32;
-    }
-    let Ok(name) = CString::new("vcruntime140.dll") else { return false };
-    unsafe {
-        let handle = LoadLibraryA(name.as_ptr());
-        if handle.is_null() {
-            false
-        } else {
-            FreeLibrary(handle);
-            true
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn ensure_vcredist_windows<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    if vcredist_installed() {
-        return;
-    }
-    log::info!("VC++ Redistributable not found — installing (required for PyTorch)");
-    emit_log(app, "checking", "Installing Microsoft Visual C++ Redistributable (required for PyTorch)…");
-    let installer = std::env::temp_dir().join("vc_redist.x64.exe");
-    let outcome: io::Result<()> = (|| {
-        let resp = ureq::get("https://aka.ms/vs/17/release/vc_redist.x64.exe")
-            .timeout(Duration::from_secs(120))
-            .call()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("download: {}", e)))?;
-        let mut f = fs::File::create(&installer)?;
-        io::copy(&mut resp.into_reader(), &mut f)?;
-        drop(f);
-        let status = Command::new(&installer)
-            .args(["/install", "/quiet", "/norestart"])
-            .status()?;
-        // Exit code 3010 = success but a reboot is recommended.
-        if status.success() || status.code() == Some(3010) {
-            Ok(())
-        } else {
-            Err(io::Error::new(io::ErrorKind::Other, format!("installer exit code {:?}", status.code())))
-        }
-    })();
-    let _ = fs::remove_file(&installer);
-    match outcome {
-        Ok(()) => log::info!("VC++ Redistributable installed"),
-        Err(e) => {
-            log::warn!("VC++ Redistributable auto-install failed: {}", e);
-            emit_log(
-                app, "checking",
-                "Could not auto-install the VC++ Redistributable — if PyTorch fails to load, \
-install it manually from https://aka.ms/vs/17/release/vc_redist.x64.exe",
-            );
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn ensure_vcredist_windows<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) {}
+// This used to live ONLY in scripts/setup.py, run via `bun run setup:api`
+// (dev loop only). Neither `scripts/` nor `setup.py` is bundled as a Tauri
+// resource (see tauri.conf.json's `bundle.resources`), and the real
+// packaged-install bootstrap path below never called that script — so every
+// actual installed user with an NVIDIA GPU got a venv with no cuDNN 8 compat
+// libs (#827). Ported here so the real app-data venv gets them, matching what
+// backend/main.py's cuDNN preload (#255) expects to find.
+//
+// (An earlier draft of #869 also ported setup.py's VC++ Redistributable
+// check. Dropped as dead code per review: the Tauri exe itself dynamically
+// links the MSVC CRT, so `LoadLibraryA("vcruntime140.dll")` from a *running*
+// app is a tautology — and torch's real failure mode is msvcp140.dll inside
+// the venv python process, not this one.)
 
 /// Cross-platform pin, matches the wheel scripts/setup.py has always used —
 /// keep both in sync if this ever needs to move.
@@ -818,12 +753,58 @@ fn count_cudnn8_libs(lib_dir: &Path, prefix: &str, suffix: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Verdict from probing the venv's torch (see `CUDNN8_CUDA_PROBE_PY`).
+#[derive(Debug, PartialEq, Eq)]
+enum CudnnProbe {
+    /// CUDA torch build with a live CUDA device: side-load cuDNN 8.
+    Install,
+    /// Definitive no — CPU-only box, no NVIDIA device, or a ROCm torch build
+    /// (HIP reports `torch.cuda.is_available() == True`, but the ~700 MB CUDA
+    /// `nvidia-cudnn-cu12` wheel is pure waste on an AMD box, #124). Cache it
+    /// so the synchronous `import torch` never taxes this venv's launches
+    /// again.
+    CacheNegative,
+    /// The probe didn't run cleanly (torch missing / broken venv / unexpected
+    /// output) — skip this launch but do NOT cache, so a transient failure
+    /// can't permanently disable the side-load on a real CUDA machine.
+    SkipNoCache,
+}
+
+/// Prints exactly one verdict: `hip` (ROCm build — checked BEFORE
+/// `cuda.is_available()`, which HIP spoofs), `cuda` (CUDA build with a live
+/// device), or `none`.
+const CUDNN8_CUDA_PROBE_PY: &str = "import torch; print('hip' if getattr(torch.version, 'hip', None) else 'cuda' if torch.cuda.is_available() else 'none')";
+
+fn classify_cuda_probe(stdout: &str) -> CudnnProbe {
+    match stdout.trim() {
+        "cuda" => CudnnProbe::Install,
+        "hip" | "none" => CudnnProbe::CacheNegative,
+        _ => CudnnProbe::SkipNoCache,
+    }
+}
+
+/// Marker recording a cached negative CUDA probe for this venv. Lives inside
+/// `.venv/` so a full venv rebuild ("Clean & Retry") clears it implicitly;
+/// anything that re-syncs the venv in place must call
+/// `invalidate_cudnn8_probe_cache` (the torch build may have changed).
+fn cudnn8_probe_marker(venv_dir: &Path) -> PathBuf {
+    venv_dir.join(".cudnn8_probe_negative")
+}
+
+/// Call after ANY operation that can change the venv's torch build (drift /
+/// repair / first-run `uv sync`, ROCm reinstall) so the next launch re-probes
+/// exactly once per venv lifetime.
+fn invalidate_cudnn8_probe_cache(venv_dir: &Path) {
+    let _ = fs::remove_file(cudnn8_probe_marker(venv_dir));
+}
+
 /// CTranslate2 (faster-whisper / WhisperX) needs cuDNN 8, but PyTorch 2.8+
 /// pulls in cuDNN 9. Side-loads cuDNN 8 into `cudnn8_compat/` next to the
 /// venv's other packages — backend/main.py preloads it via ctypes at import
-/// time (#255). Skipped entirely on macOS (no CUDA) and on any machine
-/// without a CUDA device, so this never runs on CPU-only or Apple Silicon
-/// installs.
+/// time (#255). Skipped entirely on macOS (no CUDA), on any machine without
+/// a CUDA device, and on ROCm torch builds (#124) — and a negative probe is
+/// cached per venv so CPU/AMD installs never pay the synchronous
+/// `import torch` more than once (#869 review).
 fn ensure_cudnn8_compat<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     uv_path: &Path,
@@ -832,6 +813,13 @@ fn ensure_cudnn8_compat<R: tauri::Runtime>(
     project_dir: &Path,
 ) {
     if cfg!(target_os = "macos") {
+        return;
+    }
+    // Cached negative from a previous launch (CPU/Intel/AMD — the majority of
+    // installs): return before spending any subprocess. Cleared whenever the
+    // venv is rebuilt or re-synced.
+    let marker = cudnn8_probe_marker(venv_dir);
+    if marker.is_file() {
         return;
     }
     let Some(compat_dir) = cudnn8_compat_dir(venv_dir, venv_py) else {
@@ -845,13 +833,27 @@ fn ensure_cudnn8_compat<R: tauri::Runtime>(
 
     let mut cuda_check = Command::new(venv_py);
     scrub_python_env(&mut cuda_check);
-    let cuda_available = cuda_check
-        .args(["-c", "import torch; print(torch.cuda.is_available())"])
+    let verdict = cuda_check
+        .args(["-c", CUDNN8_CUDA_PROBE_PY])
         .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "True")
-        .unwrap_or(false);
-    if !cuda_available {
-        return;
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    match classify_cuda_probe(&verdict) {
+        CudnnProbe::Install => {}
+        CudnnProbe::CacheNegative => {
+            log::info!(
+                "cuDNN 8 compat: torch probe says '{}' — caching the negative result for this venv",
+                verdict
+            );
+            let _ = fs::write(&marker, format!("{}\n", verdict));
+            return;
+        }
+        CudnnProbe::SkipNoCache => {
+            log::warn!("cuDNN 8 compat: torch probe failed — skipping this launch (not cached)");
+            return;
+        }
     }
 
     log::info!("Installing cuDNN 8 compatibility libraries for CTranslate2 (#255)");
@@ -895,11 +897,6 @@ pub fn ensure_venv_ready<R: tauri::Runtime>(app: &tauri::AppHandle<R>, progress:
     if let Some(p) = progress {
         set_stage(p, BootstrapStage::Checking);
     }
-
-    // Runs unconditionally, before any venv path is chosen — an OS-level
-    // check independent of which venv (dev-reuse or app-data) ends up
-    // serving the backend, and a no-op after the first successful install.
-    ensure_vcredist_windows(app);
 
     if let Some(dev_root) = find_dev_project_root() {
         let dev_venv = dev_root.join(".venv");
@@ -1059,6 +1056,9 @@ manually, then relaunch.",
                             match run_streaming(app, "installing_deps", &mut drift_cmd) {
                                 Ok(ref s) if s.success() => {
                                     log::info!("Dependency drift sync complete (#307)");
+                                    // The torch build may have changed — let
+                                    // ensure_cudnn8_compat() re-probe once.
+                                    invalidate_cudnn8_probe_cache(&venv_dir);
                                 }
                                 other => {
                                     // Don't brick a previously-working install
@@ -1127,6 +1127,10 @@ the existing venv; newly added dependencies may be missing (#307)",
         repair_cmd.current_dir(&project_dir);
         let repair_status = run_streaming(app, "installing_deps", &mut repair_cmd);
         if matches!(repair_status, Ok(ref s) if s.success()) {
+            // The repair sync may have changed the torch build — clear any
+            // cached negative CUDA probe so ensure_cudnn8_compat() below
+            // re-checks once.
+            invalidate_cudnn8_probe_cache(&venv_dir);
             // #248: after the repair sync, ensure pkg_resources landed. The repair
             // path is also triggered when pkg_resources is missing (see above), so
             // we must verify here rather than trusting that uv sync alone fixed it
@@ -1444,6 +1448,9 @@ mirror in Settings → region/mirrors (see docs/install/troubleshooting.md).".to
         }
     }
 
+    // Fresh venv, fresh sync: a stale negative-probe marker (e.g. a venv
+    // recreated in place over a previous one) must not suppress the probe.
+    invalidate_cudnn8_probe_cache(&venv_dir);
     ensure_cudnn8_compat(app, &uv_path, &venv_py, &venv_dir, &project_dir);
 
     // Opt-in AMD ROCm (#124): the default install ships the CUDA torch build,
@@ -1458,7 +1465,12 @@ mirror in Settings → region/mirrors (see docs/install/troubleshooting.md).".to
         apply_uv_http_env(&mut rocm_cmd);
         rocm_cmd.args(rocm_torch_reinstall_args(&rocm_url)).current_dir(&project_dir);
         let rocm_status = run_streaming(app, "installing_deps", &mut rocm_cmd);
-        if !matches!(rocm_status, Ok(ref s) if s.success()) {
+        if matches!(rocm_status, Ok(ref s) if s.success()) {
+            // The torch build just switched to ROCm: re-probe on the next
+            // launch (it reports 'hip' and re-caches the negative, so the
+            // CUDA cuDNN wheel is never fetched on an AMD box, #124).
+            invalidate_cudnn8_probe_cache(&venv_dir);
+        } else {
             log::warn!("ROCm torch reinstall failed ({:?}); keeping default torch build", rocm_status);
             emit_log(
                 app, "installing_deps",
@@ -1765,7 +1777,7 @@ mod tests {
         assert!(!(v82.0 >= 75 && v82.0 < 80), "82.x (pre-fix version) must NOT satisfy <80");
     }
 
-    // -- cuDNN 8 compat / VC++ redist (real prod bootstrap, not just dev) ----
+    // -- cuDNN 8 compat side-load (real prod bootstrap, not just dev) --------
 
     #[cfg(windows)]
     #[test]
@@ -1821,5 +1833,44 @@ mod tests {
         let missing = std::env::temp_dir().join("omnivoice-test-cudnn8-does-not-exist");
         let _ = fs::remove_dir_all(&missing);
         assert_eq!(count_cudnn8_libs(&missing, "cudnn", "64_8.dll"), 0);
+    }
+
+    #[test]
+    fn classify_cuda_probe_gates_install_on_cuda_only() {
+        // 'cuda' (CUDA build + live device) is the ONLY verdict that triggers
+        // the ~700 MB nvidia-cudnn-cu12 download.
+        assert_eq!(classify_cuda_probe("cuda"), CudnnProbe::Install);
+        assert_eq!(classify_cuda_probe("cuda\n"), CudnnProbe::Install); // print() newline
+        // ROCm torch spoofs torch.cuda.is_available(); the probe reports
+        // 'hip' first so opt-in AMD installs (#124) never fetch the CUDA
+        // wheel -- and the negative is cacheable.
+        assert_eq!(classify_cuda_probe("hip\n"), CudnnProbe::CacheNegative);
+        // Plain no-CUDA box: cache so `import torch` never re-runs at launch.
+        assert_eq!(classify_cuda_probe("none"), CudnnProbe::CacheNegative);
+        // Broken venv / import error / garbage: skip this launch but never
+        // cache -- a transient failure must not wedge a real CUDA machine.
+        assert_eq!(classify_cuda_probe(""), CudnnProbe::SkipNoCache);
+        assert_eq!(
+            classify_cuda_probe("Traceback (most recent call last):"),
+            CudnnProbe::SkipNoCache
+        );
+    }
+
+    #[test]
+    fn cudnn8_probe_cache_marker_roundtrip() {
+        let venv_dir = temp_venv_dir("cudnn-probe-cache");
+        let marker = cudnn8_probe_marker(&venv_dir);
+        // Must live INSIDE the venv so a full rebuild clears it implicitly.
+        assert!(marker.starts_with(&venv_dir));
+        assert!(!marker.is_file());
+        fs::write(&marker, "none\n").unwrap();
+        assert!(marker.is_file());
+        // Re-sync invalidation: marker gone, next launch re-probes.
+        invalidate_cudnn8_probe_cache(&venv_dir);
+        assert!(!marker.is_file());
+        // Idempotent when the marker is already absent.
+        invalidate_cudnn8_probe_cache(&venv_dir);
+        assert!(!marker.is_file());
+        let _ = fs::remove_dir_all(&venv_dir);
     }
 }

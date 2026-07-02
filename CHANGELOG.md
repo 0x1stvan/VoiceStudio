@@ -9,17 +9,17 @@ The bundled TTS model package (`pyproject.toml`) is versioned independently.
 ## [Unreleased]
 
 ### Fixed
-- **cuDNN 8 compat libraries (and the VC++ Redistributable check) were never
-  installed for real installs — only for `bun run dev`.** Both lived solely in
-  `scripts/setup.py`, which isn't bundled into the packaged app and was never
-  invoked anywhere in the Tauri bootstrap. Every actual install with an NVIDIA
-  GPU therefore got a venv with no cuDNN 8 compat libs (CUDA transcription
-  silently broken), and Windows installs on a debloated image got no VC++
-  runtime check at all. Both are now ported into the Rust bootstrap
-  (`ensure_venv_ready`) so they run for the real app-data venv on every
-  launch, not just the dev loop. Also fixed `scripts/setup.py` itself, which
-  invoked `python -m pip install` — `uv venv` doesn't seed pip, so this always
-  failed with `No module named pip`; it now uses `uv pip install --python`.
+- **CUDA transcription now works on packaged NVIDIA installs — the cuDNN 8
+  compat libraries install automatically at launch.** The install step only
+  existed in the dev-loop `scripts/setup.py`, which isn't bundled into the
+  packaged app, so real installs never got the libs and WhisperX /
+  faster-whisper failed with `Could not locate cudnn_ops_infer64_8.dll`. The
+  Rust bootstrap now side-loads them on CUDA machines; CPU/AMD/ROCm boxes skip
+  the download and cache the result so their launches stay instant. (#827, #869)
+- **`scripts/setup.py` no longer fails with `No module named pip` when
+  installing the cuDNN 8 libs in the dev loop.** `uv venv` doesn't seed pip
+  into the venv, so `python -m pip install` always broke; the script now uses
+  `uv pip install --python` instead. (#869)
 
 ## [0.3.8] — 2026-07-01
 
